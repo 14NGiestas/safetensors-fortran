@@ -29,7 +29,7 @@ program write_read
   call w%init()
   call w%set_meta('format_version', '1')
   call w%set_meta('bpb', '1.59994')                      ! characterisation travels with the weights
-  call w%set_meta('caracterização', 'acentos ok')        ! UTF-8 metadata is fine
+  call w%set_meta('characterisation', 'café, naïve')     ! UTF-8 metadata is fine
   call w%set_meta_int('n_layer', 12_int64)
   call w%set('wte', wte)                                 ! dtype and rank come from the argument
   call w%set('l3.q', q)

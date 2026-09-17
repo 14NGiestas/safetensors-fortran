@@ -1,41 +1,42 @@
-! safetensors.f90 — implementação Fortran do formato safetensors (writer + reader).
+! safetensors.f90 — Fortran implementation of the safetensors format (writer + reader).
 !
-! POR QUE ISTO EXISTE (contexto do lab, não teoria):
-! o laboratório guarda cada checkpoint como um diretório com ~90 arquivos .npy mais
-! um arch.txt paralelo. Três problemas pagos na prática: (a) não há schema — nada
-! declara nome/shape/dtype e já houve duas execuções abortadas por checkpoint e
-! arch incompatíveis; (b) 90 arquivos são 90 chances de drift e o hash é do
-! diretório, não do tensor; (c) nenhuma ferramenta de fora (Python/HF) lê os pesos.
-! O safetensors resolve os três: header JSON com nome/dtype/shape/offsets, buffer
-! contíguo e o campo oficial `__metadata__` — a caracterização do modelo
-! (bpb, métricas, linhagem, custo) viaja JUNTO com os pesos.
+! WHY THIS EXISTS (lab context, not theory):
+! the lab stores every checkpoint as a directory with ~90 .npy files plus a parallel
+! arch.txt. Three problems we actually paid for: (a) there is no schema — nothing
+! declares name/shape/dtype, and two runs were already aborted by checkpoint/arch
+! mismatches; (b) 90 files are 90 chances of drift and the hash is per directory,
+! not per tensor; (c) no outside tool (Python/HF) can read the weights.
+! safetensors fixes all three: a JSON header with name/dtype/shape/offsets, one
+! contiguous buffer, and the official `__metadata__` field — the model's
+! characterisation (bpb, metrics, lineage, cost) travels WITH the weights.
 !
-! CONTRATOS DA BIBLIOTECA:
-!   * zero dependências externas (nem stdlib);
-!   * NUNCA chama stop/error stop: toda falha volta como stat + msg;
-!   * little-endian em disco (é o que a spec manda). O host é testado em runtime
-!     (st_host_is_little_endian) e um host big-endian recebe erro explícito em vez
-!     de escrever bytes trocados em silêncio. Não há byteswap: é uma limitação
-!     declarada, não uma suposição escondida;
-!   * offsets são int64 e o payload é montado byte a byte, sem aritmética com os
-!     valores: NaN/Inf/-0.0 sobrevivem ao round-trip bit a bit (comparar bytes,
-!     nunca `==` com float — NaN != NaN);
-!   * ordem dos tensores na escrita: ORDEM DE INSERÇÃO (documentada), com offsets
-!     estritamente crescentes; `__metadata__` sempre presente e com chaves em
-!     ordem lexicográfica de bytes (estável, para diff/reprodutibilidade).
+! LIBRARY CONTRACTS:
+!   * zero external dependencies (not even stdlib);
+!   * NEVER calls stop/error stop: every failure comes back as stat + msg;
+!   * little-endian on disk (that is what the spec mandates). The host is tested at
+!     runtime (st_host_is_little_endian) and a big-endian host gets an explicit error
+!     instead of silently writing swapped bytes. There is no byteswap: this is a
+!     declared limitation, not a hidden assumption;
+!   * offsets are int64 and the payload is assembled byte by byte, with no arithmetic
+!     on the values: NaN/Inf/-0.0 survive the round-trip bit for bit (compare bytes,
+!     never `==` on floats — NaN != NaN);
+!   * tensor order when writing: INSERTION ORDER (documented), with strictly
+!     increasing offsets; `__metadata__` is always present, with keys in byte-wise
+!     lexicographic order (stable, for diffing and reproducibility).
 !
-! LIMITAÇÕES DECLARADAS (ver README, seção "Honest limitations"):
-!   * host big-endian não é suportado (erro na hora, não corrupção);
-!   * `get` tipado existe para F32/F64/I32/I64/U8/BOOL; outros dtypes (F16, BF16,
-!     FP8, I8, U16...) podem ser lidos CRUS com `get_raw` e inspecionados com
+! DECLARED LIMITATIONS (see the README, "Honest limitations"):
+!   * a big-endian host is not supported (it errors out, it does not corrupt);
+!   * typed `get` exists for F32/F64/I32/I64/U8/BOOL; other dtypes (F16, BF16, FP8,
+!     I8, U16...) can be read RAW with `get_raw` and inspected through
 !     shape/dtype/nbytes;
-!   * rank de shape até 8 no header; `get_*_2d` só aceita rank <= 2;
-!   * o writer COPIA o payload para um buffer interno (o chamador pode liberar os
-!     arrays logo após `set`); o reader NÃO copia: lê o arquivo direto para a
-!     memória do array devolvido (um único read, sem buffer intermediário);
-!   * sem mmap (o arquivo é lido com I/O posicional padrão);
-!   * o writer sem `set_meta` grava `__metadata__:{}`; o escritor oficial OMITE a
-!     chave quando não há metadata. É a única diferença conhecida de bytes.
+!   * header shapes up to rank 8; `get_*_2d` only accepts rank <= 2;
+!   * the writer COPIES the payload into an internal buffer (the caller may free
+!     the arrays right after `set`); the reader does NOT copy: it reads the file
+!     straight into the memory of the array it returns (one read, no intermediate
+!     buffer);
+!   * no mmap (the file is read with plain positional I/O);
+!   * a writer with no `set_meta` emits `__metadata__:{}`; the official writer
+!     OMITS the key when there is no metadata. The only known byte difference.
 module safetensors
   use, intrinsic :: iso_fortran_env, only: int8, int16, int32, int64, real32, real64
   use, intrinsic :: iso_c_binding, only: c_f_pointer, c_loc, c_ptr
@@ -46,35 +47,35 @@ module safetensors
   private
 
   character(*), parameter, public :: st_version = '0.1.0'
-  ! Teto do header, igual ao da implementação oficial (README do safetensors:
-  ! "a limit on the size of the header of 100MB"): protege contra um header
-  ! gigante que mataria a memória antes de qualquer validação.
+  ! Header ceiling, same as the official implementation (safetensors README:
+  ! "a limit on the size of the header of 100MB"): it stops a giant header from
+  ! killing memory before any validation can run.
   integer(int64), parameter, public :: st_max_header_bytes = 100000000_int64
-  ! Rank máximo aceito no header. A spec não impõe limite; 8 é folga sobre
-  ! qualquer tensor real e mantém o registro de shape em tamanho fixo.
+  ! Maximum rank accepted in a header. The spec imposes no limit; 8 is slack over
+  ! any real tensor and keeps the shape record a fixed size.
   integer, parameter, public :: st_max_rank = 8
-  ! Dtypes que esta versão sabe DESCREVER (mesma tabela da enum Dtype oficial).
+  ! Dtypes this version can DESCRIBE (same table as the official Dtype enum).
   integer, parameter, public :: st_ndtypes = 22
 
-  ! ------------------------------------------------------------ códigos de erro
+  ! -------------------------------------------------------------- error codes
   integer, parameter, public :: st_ok = 0
-  integer, parameter, public :: st_err_io = 1            ! open/read/write do SO
-  integer, parameter, public :: st_err_not_found = 2     ! arquivo inexistente
-  integer, parameter, public :: st_err_truncated = 3     ! arquivo menor que o header
-  integer, parameter, public :: st_err_header_size = 4   ! header vazio/absurdo
-  integer, parameter, public :: st_err_json = 5          ! JSON malformado
-  integer, parameter, public :: st_err_schema = 6        ! JSON válido, header errado
-  integer, parameter, public :: st_err_dtype = 7         ! dtype desconhecido/não suportado
-  integer, parameter, public :: st_err_offsets = 8       ! sobreposição/buraco/tamanho
-  integer, parameter, public :: st_err_missing = 9       ! tensor ausente
-  integer, parameter, public :: st_err_type_mismatch = 10! dtype do tensor != tipo pedido
-  integer, parameter, public :: st_err_duplicate = 11    ! nome repetido
-  integer, parameter, public :: st_err_not_open = 12     ! reader sem open
-  integer, parameter, public :: st_err_range = 13        ! rank/item fora do suportado
-  integer, parameter, public :: st_err_value = 14        ! valor inválido no payload (bool)
-  integer, parameter, public :: st_err_endian = 15       ! host big-endian
+  integer, parameter, public :: st_err_io = 1            ! OS open/read/write
+  integer, parameter, public :: st_err_not_found = 2     ! no such file
+  integer, parameter, public :: st_err_truncated = 3     ! file smaller than the header
+  integer, parameter, public :: st_err_header_size = 4   ! empty/absurd header
+  integer, parameter, public :: st_err_json = 5          ! malformed JSON
+  integer, parameter, public :: st_err_schema = 6        ! valid JSON, wrong header
+  integer, parameter, public :: st_err_dtype = 7         ! unknown/unsupported dtype
+  integer, parameter, public :: st_err_offsets = 8       ! overlap/hole/size mismatch
+  integer, parameter, public :: st_err_missing = 9       ! missing tensor
+  integer, parameter, public :: st_err_type_mismatch = 10! tensor dtype != requested type
+  integer, parameter, public :: st_err_duplicate = 11    ! repeated name
+  integer, parameter, public :: st_err_not_open = 12     ! reader not open
+  integer, parameter, public :: st_err_range = 13        ! rank/item outside the supported range
+  integer, parameter, public :: st_err_value = 14        ! invalid payload value (bool)
+  integer, parameter, public :: st_err_endian = 15       ! big-endian host
 
-  ! --------------------------------------------------------------- tipos de dado
+  ! ------------------------------------------------------------------ data types
   integer, parameter :: dt_bool = 1, dt_f4 = 2, dt_f6_e2m3 = 3, dt_f6_e3m2 = 4, &
                         dt_u8 = 5, dt_i8 = 6, dt_f8_e5m2 = 7, dt_f8_e4m3 = 8, &
                         dt_f8_e8m0 = 9, dt_f8_e4m3fnuz = 10, dt_f8_e5m2fnuz = 11, &
@@ -86,13 +87,13 @@ module safetensors
     'BOOL', 'F4', 'F6_E2M3', 'F6_E3M2', 'U8', 'I8', 'F8_E5M2', 'F8_E4M3', &
     'F8_E8M0', 'F8_E4M3FNUZ', 'F8_E5M2FNUZ', 'I16', 'U16', 'F16', 'BF16', &
     'I32', 'U32', 'F32', 'C64', 'F64', 'I64', 'U64']
-  ! bits por elemento; a tabela é a da enum Dtype oficial (safetensors/src/tensor.rs)
+  ! bits per element; the table is the official Dtype enum's (safetensors/src/tensor.rs)
   integer, parameter :: dt_bits(st_ndtypes) = [8, 4, 6, 6, 8, 8, 8, 8, 8, 8, 8, &
                                               16, 16, 16, 16, 32, 32, 32, 64, 64, 64, 64]
 
   public :: st_dtype_bits, st_dtype_name, st_host_is_little_endian, st_writer, st_reader
 
-  ! --------------------------------------------------------------- tipos
+  ! ------------------------------------------------------------------- types
   type :: st_kv
     character(len=:), allocatable :: k, v
   end type st_kv
@@ -116,7 +117,7 @@ module safetensors
     integer(int8), allocatable :: buf(:)
     type(st_kv), allocatable :: md(:)
     integer :: nm = 0
-    integer :: estat = st_ok          ! primeiro erro pendente (ver wr_fail)
+    integer :: estat = st_ok          ! first pending error (see wr_fail)
     character(len=:), allocatable :: emsg
   contains
     procedure :: init => wr_init
@@ -162,8 +163,8 @@ module safetensors
     procedure :: file_size => rd_file_size
     procedure :: header_size => rd_header_size
     procedure :: buffer_size => rd_buffer_size
-    ! Cada getter é um binding privado; `get` é o genérico que resolve tipo e
-    ! rank a partir do ponteiro declarado pelo chamador (ambiguidade zero).
+    ! Every getter is a private binding; `get` is the generic that resolves type
+    ! and rank from the pointer the caller declared (zero ambiguity).
     procedure, private :: rd_get_r32_1, rd_get_r32_2, rd_get_r64_1, rd_get_r64_2, &
       rd_get_i32_1, rd_get_i32_2, rd_get_i64_1, rd_get_i64_2, rd_get_u8_1, &
       rd_get_u8_2, rd_get_bool_1
@@ -175,7 +176,7 @@ module safetensors
 
 contains
 
-  ! =========================================================== utilidades comuns
+  ! ============================================================ common helpers
   pure function i2s(v) result(s)
     integer(int64), intent(in) :: v
     character(len=:), allocatable :: s
@@ -217,8 +218,8 @@ contains
     end do
   end function dtype_lookup
 
-  ! Endianness do host. Testada, não assumida: escrever little-endian num host
-  ! big-endian produziria um arquivo que só "parece" certo.
+  ! Host endianness. Tested, not assumed: writing little-endian on a big-endian
+  ! host would produce a file that only looks right.
   pure function st_host_is_little_endian() result(le)
     logical :: le
     integer(int32) :: x
@@ -250,8 +251,8 @@ contains
     end do
   end function i64_from_le
 
-  ! Comparação byte a byte de strings (ordem lexicográfica de bytes, não a
-  ! colação do processador). Usada para ordenar as chaves de `__metadata__`.
+  ! Byte-by-byte string comparison (byte-wise lexicographic order, not the
+  ! processor's collating sequence). Used to sort the `__metadata__` keys.
   pure function str_less(a, b) result(r)
     character(*), intent(in) :: a, b
     logical :: r
@@ -364,8 +365,8 @@ contains
     end do
   end subroutine wr_meta_value
 
-  ! Insere mantendo a ordem lexicográfica (busca linear: metadata tem dezenas de
-  ! chaves, não milhões). Chave repetida SOBRESCREVE — semântica de `set`.
+  ! Insert keeping lexicographic order (linear search: metadata holds dozens of
+  ! keys, not millions). A repeated key OVERWRITES — `set` semantics.
   subroutine wr_set_meta(self, key, val, stat, msg)
     class(st_writer), intent(inout) :: self
     character(*), intent(in) :: key, val
@@ -407,10 +408,10 @@ contains
     if (present(msg)) msg = lmsg
   end subroutine wr_set_meta_int
 
-  ! `set` genérico via assumed-rank (`class(*), intent(in) :: a(..)`): o tipo e o
-  ! rank vêm do argumento, então `call w%set("wte", wte)` funciona para
-  ! real32/real64/int32/int64/int8/logical, 1-D ou 2-D. Tipo não suportado
-  ! devolve erro com a lista do que é suportado — nunca grava bytes errados.
+  ! Generic `set` through assumed-rank (`class(*), intent(in) :: a(..)`): the type
+  ! and rank come from the argument, so `call w%set("wte", wte)` works for
+  ! real32/real64/int32/int64/int8/logical, 1-D or 2-D. An unsupported type
+  ! returns an error listing what is supported — it never writes wrong bytes.
   subroutine wr_set(self, name, a, stat, msg)
     class(st_writer), intent(inout) :: self
     character(*), intent(in) :: name
@@ -551,9 +552,9 @@ contains
     if (nb > 0) call wr_put_bytes(self, transfer(src, 0_int8, nb))
   end subroutine wr_add2
 
-  ! Registra o tensor (nome/dtype/shape/offsets) e reserva espaço no payload.
-  ! Nada de aritmética com os VALORES: o payload é byte cru, por isso NaN/Inf/-0.0
-  ! atravessam sem alteração.
+  ! Registers the tensor (name/dtype/shape/offsets) and reserves payload space.
+  ! No arithmetic on the VALUES: the payload is raw bytes, which is why NaN/Inf/-0.0
+  ! travel through unchanged.
   subroutine wr_commit(self, name, dt, shape, nb, stat, msg)
     class(st_writer), intent(inout) :: self
     character(*), intent(in) :: name
@@ -583,9 +584,9 @@ contains
       msg = 'tensor name ''__metadata__'' is reserved by the format'
       return
     end if
-    ! Detecção de nome repetido: busca linear. n de tensores de um modelo real é
-    ! O(10^2..10^3); a alternativa (hash) só se pagaria em O(10^4) e não vale a
-    ! complexidade aqui (o READER já tem conjunto de hash para o caso hostil).
+    ! Duplicate-name detection: linear search. A real model has O(10^2..10^3)
+    ! tensors; the alternative (a hash) would only pay off at O(10^4) and is not
+    ! worth the complexity here (the READER already has a hash set for hostile input).
     do i = 1, self%nt
       if (self%t(i)%name == name) then
         stat = st_err_duplicate
@@ -653,7 +654,7 @@ contains
     self%buf(need - size(bytes, kind=int64) + 1:need) = bytes
   end subroutine wr_put_bytes
 
-  ! Monta o texto do header (sem padding) e o comprimento já alinhado em 8.
+  ! Builds the header text (no padding) and the length already aligned to 8.
   subroutine wr_header_text(self, htext, aligned_len, stat, msg)
     class(st_writer), intent(in) :: self
     character(len=:), allocatable, intent(out) :: htext
@@ -697,9 +698,9 @@ contains
     msg = ''
   end subroutine wr_header_text
 
-  ! Erro pendente do writer. `set`/`set_meta` aceitam stat/msg OPCIONAIS (para o
-  ! caso comum de quem só quer gravar), mas nada se perde em silêncio: o primeiro
-  ! erro fica guardado e `write` se recusa a gravar enquanto ele existir.
+  ! Pending writer error. `set`/`set_meta` take OPTIONAL stat/msg (for the common
+  ! case of someone who only wants to write), but nothing is lost silently: the
+  ! first error is kept and `write` refuses to run while it is pending.
   subroutine wr_error(self, stat, msg)
     class(st_writer), intent(in) :: self
     integer, intent(out) :: stat
@@ -764,9 +765,9 @@ contains
     msg = ''
   end subroutine wr_write
 
-  ! Imagem completa do arquivo em memória. Existe para o teste de paridade
-  ! byte-a-byte não depender de arquivo temporário (e para quem quiser mandar o
-  ! arquivo por rede/socket). Aqui, sim, há uma cópia extra do payload.
+  ! The whole file image in memory. It exists so the byte-for-byte parity test
+  ! does not need a temporary file (and for anyone who wants to send the file
+  ! over a network/socket). Here there IS an extra copy of the payload.
   subroutine wr_to_bytes(self, image, stat, msg)
     class(st_writer), intent(in) :: self
     integer(int8), allocatable, intent(out) :: image(:)
@@ -795,7 +796,7 @@ contains
       if (i <= len(htext)) then
         image(8 + i) = int(iachar(htext(i:i)), int8)
       else
-        image(8 + i) = 32_int8                       ! padding com espaço (0x20)
+        image(8 + i) = 32_int8                       ! padding with a space (0x20)
       end if
     end do
     if (self%payload > 0) image(9 + alen:total) = self%buf(1:self%payload)
@@ -860,9 +861,9 @@ contains
     n = self%nm
   end function rd_n_meta
 
-  ! Abre e VALIDA o header inteiro (offsets, dtypes, cobertura do buffer) sem
-  ! materializar tensor nenhum: é isso que permite consultar shape/dtype de um
-  ! arquivo de 30 GB custando só o header.
+  ! Opens and VALIDATES the whole header (offsets, dtypes, buffer coverage)
+  ! without materialising a single tensor: that is what makes it possible to
+  ! query the shape/dtype of a 30 GB file for the price of the header.
   subroutine rd_open(self, path, stat, msg)
     class(st_reader), intent(inout) :: self
     character(*), intent(in) :: path
@@ -945,8 +946,8 @@ contains
       msg = 'cannot read the '//trim(i2s(self%hlen))//'-byte header of '''//trim(path)//''''
       return
     end if
-    ! Tamanhos ANTES do parse: a validação de cobertura precisa saber quantos
-    ! bytes existem depois do header.
+    ! Sizes BEFORE parsing: the coverage validation needs to know how many bytes
+    ! exist after the header.
     self%fsize = fsz
     self%dstart = 8_int64 + self%hlen
     self%bsize = fsz - self%dstart
@@ -1062,8 +1063,8 @@ contains
             msg = 'tensor '''//tname//''': negative extent in shape'
             return
           end if
-          ! Sem curto-circuito em `.and.`: 0 no divisor daria SIGFPE em divisão
-          ! inteira. Extensão zero zera o produto (como manda a aritmética).
+          ! No short-circuit in `.and.`: a 0 divisor would SIGFPE on integer
+          ! division. A zero extent zeroes the product (as arithmetic demands).
           if (e%shape(r) == 0) then
             nelem = 0_int64
           else
@@ -1129,10 +1130,10 @@ contains
     call rd_check_coverage(self, stat, msg)
   end subroutine rd_parse_header
 
-  ! Ordena por offset de início e exige cobertura CONTÍGUA e EXATA do buffer:
-  ! sem sobreposição e sem buraco. É a regra que impede polyglot file (um arquivo
-  ! que é safetensors E outra coisa ao mesmo tempo) e é a mesma da implementação
-  ! oficial.
+  ! Sorts by start offset and demands CONTIGUOUS and EXACT coverage of the buffer:
+  ! no overlap and no hole. That is the rule that blocks a polyglot file (a file
+  ! that is safetensors AND something else at the same time), and it is the same
+  ! rule the official implementation enforces.
   subroutine rd_check_coverage(self, stat, msg)
     class(st_reader), intent(inout) :: self
     integer, intent(out) :: stat
@@ -1244,7 +1245,7 @@ contains
     s = s//']'
   end function shape_str
 
-  ! ---------------------------------------------------------------- consultas
+  ! -------------------------------------------------------------------- queries
   subroutine rd_find(self, name, idx, stat, msg)
     class(st_reader), intent(in) :: self
     character(*), intent(in) :: name
@@ -1326,8 +1327,8 @@ contains
     msg = ''
   end subroutine rd_tensor_name
 
-  ! Shape em ORDEM C (a mesma do header e do numpy/torch). Para o array Fortran
-  ! correspondente a memória é a mesma; ver o comentário dos get_*_2d.
+  ! Shape in C ORDER (the same as the header and numpy/torch). For the Fortran
+  ! array the memory is the same one; see the get_*_2d comment.
   subroutine rd_shape(self, name, shp, stat, msg)
     class(st_reader), intent(in) :: self
     character(*), intent(in) :: name
@@ -1417,7 +1418,7 @@ contains
     key = self%md(i)%k
   end subroutine rd_meta_key
 
-  ! Assinatura do esboço da tarefa: `call r%meta("bpb", val, found)`.
+  ! Signature from the task sketch: `call r%meta("bpb", val, found)`.
   subroutine rd_meta(self, key, val, found)
     class(st_reader), intent(in) :: self
     character(*), intent(in) :: key
@@ -1435,11 +1436,11 @@ contains
     end do
   end subroutine rd_meta
 
-  ! ---------------------------------------------------------------- leitura
-  ! Lê os bytes do tensor direto para a memória do array devolvido: um único read
-  ! posicional, sem buffer intermediário (c_f_pointer enxerga o target do ponteiro
-  ! como int8). Nenhuma aritmética é feita com os valores, então -0.0/NaN/Inf
-  ! atravessam intactos.
+  ! -------------------------------------------------------------------- reading
+  ! Reads the tensor bytes straight into the memory of the returned array: one
+  ! positional read, no intermediate buffer (c_f_pointer sees the pointer target
+  ! as int8). No arithmetic is done on the values, so -0.0/NaN/Inf
+  ! travel through intact.
   subroutine read_at(self, i, dst, stat, msg)
     class(st_reader), intent(in) :: self
     integer, intent(in) :: i
@@ -1475,8 +1476,8 @@ contains
     msg = ''
   end subroutine read_at
 
-  ! Verifica se o dtype do tensor casa com o tipo Fortran pedido, com mensagem
-  ! que diz os dois lados (não "erro de tipo").
+  ! Checks whether the tensor dtype matches the requested Fortran type, with a
+  ! message that names BOTH sides (not a bare "type error").
   subroutine check_dt(self, i, want, asked, stat, msg)
     class(st_reader), intent(in) :: self
     integer, intent(in) :: i, want
@@ -1513,19 +1514,19 @@ contains
   end subroutine rd_get_raw
 
 ! --------------------------------------------------------------------- getters
-! Todos seguem o mesmo desenho: `rd_prepare` procura o tensor e confere o dtype
-! contra o tipo Fortran pedido (mensagem diz os DOIS lados), aloca-se o array já
-! no tamanho final e o read posicional escreve direto na memória dele. Zero
-! cópia intermediária: é isso que a promessa "sem cópia extra" significa aqui.
+! They all follow the same design: `rd_prepare` finds the tensor and checks its
+! dtype against the requested Fortran type (the message names BOTH), the array is
+! allocated at its final size, and the positional read writes straight into that
+! memory. Zero intermediate copy: that is what "no extra copy" means here.
 !
-! Sobre rank: um tensor de rank N no header é, em memória, um bloco em ordem C
-! (row-major). Fortran é column-major, então `get_*_1d` devolve o bloco achatado
-! e `get_*_2d` devolve as extensões invertidas:
-!     header shape [d0, d1]  ->  array Fortran (d1, d0)   [a(1,1) = (0,0) em C]
-!     header shape [n]       ->  array Fortran (1, n)
-! Assim nada é transposto nem copiado, e `sum(a)` coincide dos dois lados.
+! About rank: a rank-N tensor in the header is, in memory, a block in C order
+! (row-major). Fortran is column-major, so `get_*_1d` returns the flattened block
+! and `get_*_2d` returns the extents reversed:
+!     header shape [d0, d1]  ->  Fortran array (d1, d0)   [a(1,1) = (0,0) in C]
+!     header shape [n]       ->  Fortran array (1, n)
+! That way nothing is transposed or copied, and `sum(a)` matches on both sides.
 
-  ! Extensões Fortran (column-major) do array 2-D correspondente ao shape em ordem C.
+  ! Fortran extents (column-major) of the 2-D array matching a C-order shape.
   subroutine fortran_dims2(e, d1, d2)
     type(st_tensor), intent(in) :: e
     integer(int64), intent(out) :: d1, d2
@@ -1538,7 +1539,7 @@ contains
     end if
   end subroutine fortran_dims2
 
-  ! Procura + confere dtype numa chamada só (usado por todos os getters).
+  ! Lookup + dtype check in a single call (used by every getter).
   subroutine rd_prepare(self, tname, want_dt, asked, i, stat, msg)
     class(st_reader), intent(in) :: self
     character(*), intent(in) :: tname
@@ -1787,9 +1788,9 @@ contains
     end if
   end subroutine rd_get_u8_2
 
-  ! BOOL precisa de uma passagem a mais: no arquivo é 1 byte (0 ou 1) e `logical`
-  ! em gfortran ocupa 4 bytes. É também aqui que byte inválido (ex.: 7) vira ERRO
-  ! em vez de `.true.` silencioso — a implementação oficial também rejeita.
+  ! BOOL needs one extra pass: on disk it is 1 byte (0 or 1) while `logical` takes
+  ! 4 bytes in gfortran. This is also where an invalid byte (say 7) becomes an
+  ! ERROR instead of a silent `.true.` — the official implementation rejects it too.
   subroutine rd_get_bool_1(self, tname, p, stat, msg)
     class(st_reader), intent(in) :: self
     character(*), intent(in) :: tname

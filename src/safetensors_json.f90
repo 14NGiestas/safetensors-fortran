@@ -1,47 +1,47 @@
-! safetensors_json.f90 — parser e emissor JSON mínimos, sem dependência externa.
+! safetensors_json.f90 — minimal JSON parser and emitter, no external dependency.
 !
-! POR QUE UM JSON PRÓPRIO, e não stdlib/json-fortran:
-!   (1) a biblioteca promete zero dependências (o laboratório compila isso junto
-!       com kernels BLAS e não quer arrastar um gerenciador de pacotes);
-!   (2) o subset que o safetensors usa é minúsculo (objeto, string, inteiro,
-!       array de inteiros). Um parser deste tamanho é auditável por inteiro —
-!       importa porque o header é dado NÃO CONFIÁVEL, vindo de fora do lab;
-!   (3) controle total das mensagens: cada rejeição diz o que estava errado e em
-!       que byte, não só "invalid JSON".
+! WHY A JSON LAYER OF OUR OWN, and not stdlib/json-fortran:
+!   (1) the library promises zero dependencies (the lab builds this next to BLAS
+!       kernels and does not want to drag a package manager along);
+!   (2) the subset safetensors uses is tiny (object, string, integer, array of
+!       integers). A parser this size is auditable end to end — which matters
+!       because the header is UNTRUSTED data coming from outside the lab;
+!   (3) full control of the messages: every rejection says what was wrong and at
+!       which byte, not just "invalid JSON".
 !
-! POR QUE "ARENA PLANA" E NÃO UMA ÁRVORE DE TIPOS DERIVADOS (armadilha real):
-! a versão inicial usava um tipo recursivo (`type :: json_value` contendo
-! `type(json_value), allocatable :: items(:)`) — o desenho "óbvio". Com
-! gfortran 15.3 isso CRASHA (free(): invalid pointer / SIGSEGV) na desalocação
-! de uma cópia profunda desse tipo; reproduzido em 10 linhas isoladas
-! (tools/../REPORT.md cita o caso). Em vez de depender de um bug de compilador,
-! os nós vivem em vetores planos de tipos intrínsecos e as ligações entre eles
-! são ÍNDICES inteiros:
-!     nkind(i)          tipo do nó i (json_object, json_string, ...)
-!     sbeg(i), slen(i)  span da string do nó i dentro de `text`
-!     efirst(i),ecount(i)  bloco contíguo de arestas filhas do nó i
-!     echild(e)         nó filho da aresta e
-!     kbeg(e), klen(e)  span da chave (objetos) ou 0 (arrays)
-! Ganhos colaterais: nada de cópia profunda, nada de finalização recursiva,
-! memória contígua e spans válidos para sempre (o buffer de texto cresce com
-! move_alloc e nunca é realocado por baixo dos spans).
+! WHY A "FLAT ARENA" AND NOT A TREE OF DERIVED TYPES (a real trap):
+! the first version used a recursive type (`type :: json_value` containing
+! `type(json_value), allocatable :: items(:)`) — the "obvious" design. With
+! gfortran 15.3 that CRASHES (free(): invalid pointer / SIGSEGV) when a deep copy
+! of such a value is deallocated; reproduced in 10 isolated lines
+! (the case is written up in REPORT.md). Instead of depending on a compiler bug,
+! the nodes live in flat vectors of intrinsic types and the links between them
+! are integer INDICES:
+!     nkind(i)          kind of node i (json_object, json_string, ...)
+!     sbeg(i), slen(i)  span of node i's string inside `text`
+!     efirst(i),ecount(i)  contiguous block of child edges of node i
+!     echild(e)         child node of edge e
+!     kbeg(e), klen(e)  span of the key (objects) or 0 (arrays)
+! Side benefits: no deep copies, no recursive finalisation, contiguous memory,
+! and spans that stay valid forever (the text buffer grows through move_alloc and
+! is never reallocated under the spans).
 !
-! O que é deliberadamente NÃO suportado (rejeitado com mensagem, nunca ignorado):
-! floats em JSON, chaves duplicadas no mesmo objeto, aninhamento acima de 16
-! níveis, escape inválido, caractere de controle cru dentro de string. O formato
-! só usa inteiros — aceitar floats seria superfície de bug de graça.
+! What is deliberately NOT supported (rejected with a message, never ignored):
+! floats in JSON, duplicate keys in the same object, nesting deeper than 16
+! levels, invalid escapes, raw control characters inside a string. The format
+! only uses integers — accepting floats would be free bug surface.
 !
-! Cuidado importante: a emissão tem de casar byte a byte com o serde_json (o
-! escritor oficial) senão a paridade byte-a-byte com a referência quebra:
+! Important: the emission has to match serde_json (the official writer) byte for
+! byte, otherwise the byte-for-byte parity with the reference breaks:
 !   `"` -> `\"`; `\` -> `\\`; 0x08/09/0A/0C/0D -> `\b \t \n \f \r`;
-!   outros < 0x20 -> `\u00xx` (hex MINÚSCULO); `/` NÃO é escapado; 0x7F e bytes
-!   >= 0x80 passam crus (UTF-8 preservado).
+!   other bytes < 0x20 -> `\u00xx` (LOWERCASE hex); `/` is NOT escaped; 0x7F and
+!   bytes >= 0x80 pass through raw (UTF-8 preserved).
 module safetensors_json
   use, intrinsic :: iso_fortran_env, only: int64
   implicit none
   private
 
-  ! ------------------------------------------------------------------ códigos
+  ! ------------------------------------------------------------- error codes
   integer, parameter, public :: json_ok = 0
   integer, parameter, public :: json_err_syntax = 1
   integer, parameter, public :: json_err_truncated = 2
@@ -50,7 +50,7 @@ module safetensors_json
   integer, parameter, public :: json_err_overflow = 5
   integer, parameter, public :: json_err_trailing = 6
 
-  ! ------------------------------------------------------------- tipos de nó
+  ! --------------------------------------------------------------- node kinds
   integer, parameter, public :: json_object = 1
   integer, parameter, public :: json_array = 2
   integer, parameter, public :: json_string = 3
@@ -58,13 +58,13 @@ module safetensors_json
   integer, parameter, public :: json_bool = 5
   integer, parameter, public :: json_null = 6
 
-  ! O formato real tem profundidade 2; 16 é folga e corta "[[[[[[..." hostil.
+  ! The real format is 2 levels deep; 16 is slack and cuts short a hostile "[[[[[[...".
   integer, parameter :: max_depth = 16
 
-  ! ------------------------------------------------------------------- tipos
+  ! -------------------------------------------------------------------- types
   type, public :: json_doc
     private
-    character(len=:), allocatable :: text      ! todas as strings concatenadas
+    character(len=:), allocatable :: text      ! every string, concatenated
     integer(int64) :: tlen = 0
     integer, allocatable :: nkind(:)
     integer(int64), allocatable :: nnum(:)
@@ -88,10 +88,10 @@ module safetensors_json
     procedure :: bool_of => jd_bool_of
   end type json_doc
 
-  ! Buffer de saída com crescimento geométrico. Concatenação ingênua
-  ! (`s = s // c`) é O(n^2) e o header de um modelo de 90 tensores com card de
-  ! metadata passa de alguns KiB; o teste de 1024x1024 existe para pegar
-  ! regressão quadrática, então aqui também não pode ser quadrático.
+  ! Output buffer with geometric growth. Naive concatenation
+  ! (`s = s // c`) is O(n^2), and the header of a 90-tensor model with a card of
+  ! metadata is several KiB; the 1024x1024 test exists to catch a quadratic
+  ! regression, so this one must not be quadratic either.
   type, public :: json_writer
     private
     character(len=:), allocatable :: buf
@@ -115,7 +115,7 @@ module safetensors_json
 
 contains
 
-  ! ============================================================ consultas
+  ! =============================================================== queries
   pure function jd_root(self) result(i)
     class(json_doc), intent(in) :: self
     integer :: i
@@ -190,8 +190,8 @@ contains
     end if
   end function jd_bool_of
 
-  ! Índice do filho com a chave `key` (0 se não existir). Comparação por span,
-  ! sem materializar as chaves.
+  ! Index of the child with key `key` (0 when absent). Compared span by span,
+  ! without materialising the keys.
   function jd_member(self, i, key) result(c)
     class(json_doc), intent(in) :: self
     integer, intent(in) :: i
@@ -214,7 +214,7 @@ contains
     end do
   end function jd_member
 
-  ! ================================================================ parser
+  ! ================================================================= parser
   subroutine json_parse(text, doc, stat, msg)
     character(*), intent(in) :: text
     type(json_doc), intent(out) :: doc
@@ -249,7 +249,7 @@ contains
     type(json_parser), intent(inout) :: p
     integer, intent(in) :: code
     character(*), intent(in) :: text
-    ! Preserva o PRIMEIRO erro: é o mais informativo (os seguintes são cascata).
+    ! Keeps the FIRST error: it is the informative one (the rest are cascade).
     if (p%stat /= json_ok) return
     p%stat = code
     p%msg = text
@@ -268,7 +268,7 @@ contains
     end do
   end subroutine jp_skip_ws
 
-  ! Espaço é o padding oficial (0x20); NUL é tolerado por defensividade.
+  ! Space is the official padding (0x20); NUL is tolerated defensively.
   subroutine jp_skip_trailing(p)
     type(json_parser), intent(inout) :: p
     integer :: c
@@ -348,7 +348,7 @@ contains
     p%pos = p%pos + l
   end subroutine jp_literal
 
-  ! Somente inteiros: ver o cabeçalho do módulo.
+  ! Integers only: see the module header.
   subroutine jp_number(p, val)
     type(json_parser), intent(inout) :: p
     integer(int64), intent(out) :: val
@@ -401,8 +401,8 @@ contains
     end if
   end subroutine jp_number
 
-  ! Decodifica uma string JSON direto para o buffer de texto da arena; devolve o
-  ! span (beg,len). Nada de string intermediária: menos cópia e menos alocação.
+  ! Decodes a JSON string straight into the arena's text buffer; it returns the
+  ! span (beg,len). No intermediate string: less copying and fewer allocations.
   subroutine jp_string(p, d, beg, sln)
     type(json_parser), intent(inout) :: p
     type(json_doc), intent(inout) :: d
@@ -428,7 +428,7 @@ contains
       if (c == '"') then
         p%pos = p%pos + 1
         exit
-      else if (ia == 92) then                    ! '\' via código, sem confusão de literal
+      else if (ia == 92) then                    ! '\' by code, no literal confusion
         p%pos = p%pos + 1
         call jp_escape(p, d, sln)
         if (p%stat /= json_ok) return
@@ -573,7 +573,7 @@ contains
     character(len=:), allocatable :: key
 
     d%nkind(idx) = json_object
-    p%pos = p%pos + 1                                  ! consome '{'
+    p%pos = p%pos + 1                                  ! consumes '{'
     nk = 0
     cap = 8
     allocate (kids(cap), kb(cap), kl(cap))
@@ -626,9 +626,9 @@ contains
     end do
     call jd_add_edges(d, idx, kids(1:nk), kb(1:nk), kl(1:nk), p)
     if (p%stat /= json_ok) return
-    ! Chave duplicada é inválida no formato (a oficial rejeita). Detecção em O(n)
-    ! com conjunto de hash: com 100 MB de header cabem ~1M chaves e um laço
-    ! quadrático ali seria justamente o vetor de DoS que este formato combate.
+    ! A duplicate key is invalid in this format (the official writer rejects it).
+    ! Detected in O(n) with a hash set: a 100 MB header can hold ~1M keys, and a
+    ! quadratic loop there would be exactly the DoS vector this format fights.
     call jp_check_duplicate_keys(p, d, idx)
   contains
     subroutine grow_obj(k, b, l, c)
@@ -706,7 +706,7 @@ contains
     call jd_add_edges(d, idx, kids(1:n), dum(1:n), dum(1:n), p)
   end subroutine jp_array
 
-  ! FNV-1a 64 + tabela de endereçamento aberto sobre os spans das chaves.
+  ! FNV-1a 64 + open-addressing table over the key spans.
   subroutine jp_check_duplicate_keys(p, d, idx)
     type(json_parser), intent(inout) :: p
     type(json_doc), intent(in) :: d
@@ -752,7 +752,7 @@ contains
     h = -3750763034362895579_int64                 ! 14695981039346656037 mod 2^64
     do i = 1, d%klen(e)
       h = ieor(h, iand(int(iachar(d%text(d%kbeg(e) + i - 1:d%kbeg(e) + i - 1)), int64), 255_int64))
-      h = h*1099511628211_int64                    ! overflow benigno: mod 2^64
+      h = h*1099511628211_int64                    ! benign overflow: mod 2^64
     end do
   end function span_hash
 
@@ -770,7 +770,7 @@ contains
         d%text(d%kbeg(e2):d%kbeg(e2) + d%klen(e2) - 1)
   end function same_span
 
-  ! ============================================================ construção
+  ! ============================================================ construction
   subroutine jd_add_node(d, idx)
     type(json_doc), intent(inout) :: d
     integer, intent(out) :: idx
@@ -813,7 +813,7 @@ contains
     d%nflag(idx) = .false.
   end subroutine jd_add_node
 
-  ! Bloco de arestas (filhos) do nó `idx`: contíguo, com as chaves (objetos).
+  ! Edge (child) block of node `idx`: contiguous, carrying the keys (objects).
   subroutine jd_add_edges(d, idx, kids, kb, kl, p)
     type(json_doc), intent(inout) :: d
     integer, intent(in) :: idx
@@ -852,7 +852,7 @@ contains
     end do
   end subroutine jd_add_edges
 
-  ! Anexa um byte ao buffer de texto da arena (crescimento geométrico).
+  ! Appends one byte to the arena's text buffer (geometric growth).
   subroutine jd_put(d, c)
     type(json_doc), intent(inout) :: d
     character, intent(in) :: c
@@ -869,8 +869,8 @@ contains
     d%text(d%tlen:d%tlen) = c
   end subroutine jd_put
 
-  ! UTF-8 de um code point: quem escreve \u precisa virar os mesmos bytes que o
-  ! emissor escreveria (o serde_json emite bytes crus, sem \u, para não-ASCII).
+  ! UTF-8 for one code point: a writer that emits \u has to produce the same bytes
+  ! our emitter would (serde_json emits non-ASCII raw, never as \u).
   subroutine jd_put_utf8(d, cp, sln)
     type(json_doc), intent(inout) :: d
     integer, intent(in) :: cp
@@ -896,7 +896,7 @@ contains
     end if
   end subroutine jd_put_utf8
 
-  ! ============================================================== emissão
+  ! ================================================================ emission
   subroutine jw_reset(self)
     class(json_writer), intent(inout) :: self
     self%n = 0
@@ -947,8 +947,8 @@ contains
     end if
   end function jw_finish
 
-  ! Escapa conforme o serde_json (ver cabeçalho do módulo). Público porque o
-  ! teste de paridade usa a mesma função para conferir o escapamento.
+  ! Escapes the way serde_json does (see the module header). Public because the
+  ! parity test uses the very same function to check the escaping.
   pure function json_escape(s) result(out)
     character(*), intent(in) :: s
     character(len=:), allocatable :: out
@@ -956,7 +956,7 @@ contains
     character :: c
     integer :: i, pos, ia
     character(len=6) :: esc
-    character(len=4), parameter :: hexd = '0123456789abcdef'   ! minúsculo: igual ao serde_json
+    character(len=4), parameter :: hexd = '0123456789abcdef'   ! lowercase: same as serde_json
 
     pos = 0
     do i = 1, len(s)
@@ -989,7 +989,7 @@ contains
     out = tmp(1:pos)
   end function json_escape
 
-  ! ============================================================== utilidades
+  ! ================================================================ utilities
   pure function int2str(v) result(s)
     integer(int64), intent(in) :: v
     character(len=:), allocatable :: s
@@ -1008,11 +1008,11 @@ contains
     s(2:2) = h(mod(x, 16) + 1:mod(x, 16) + 1)
   end function to_hex2
 
-  ! ============================================================== ordenação
-  ! Heapsort sobre vetor de índices, ordenado por `keys`. Usado para ordenar os
-  ! tensores por offset de início (o JSON não garante ordem de chaves).
-  ! Heapsort (e não insertion sort) porque um header hostil pode ter ~1M tensores
-  ! e O(n^2) ali seria um vetor de DoS.
+  ! ================================================================= sorting
+  ! Heapsort over an index vector, ordered by `keys`. Used to sort the tensors by
+  ! start offset (JSON does not guarantee key order).
+  ! Heapsort (not insertion sort) because a hostile header can hold ~1M tensors,
+  ! and O(n^2) there would be a DoS vector.
   subroutine sort_indices(keys, idx)
     integer(int64), intent(in) :: keys(:)
     integer, allocatable, intent(out) :: idx(:)

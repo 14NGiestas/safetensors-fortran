@@ -80,7 +80,7 @@ LAYER_RE = re.compile(r"transformer_h_(\d+)_")
 
 
 def read_arch(path):
-    """arch.txt is `chave = valor`; keep the textual values (metadata is strings)."""
+    """arch.txt is `key = value`; keep the textual values (metadata is strings)."""
     arch = {}
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
@@ -190,7 +190,7 @@ def build_metadata(args, arch, template, tensors, manifest_path):
             open(os.path.join(args.ckpt_dir, "template.txt"), "rb").read()
         )
 
-    # sha256 do manifesto de dados (se houver) e sha256 do manifesto de tensores.
+    # sha256 of the data manifest (when given) and sha256 of the tensor manifest.
     if manifest_path and os.path.exists(manifest_path):
         meta["manifest.path"] = os.path.abspath(manifest_path)
         meta["manifest.sha256"] = sha256_bytes(open(manifest_path, "rb").read())
@@ -217,7 +217,7 @@ def build_metadata(args, arch, template, tensors, manifest_path):
             "rows": "",
             "tokens_total": "",
         },
-        # Preenchido depois pelo treino: aqui só o ESQUELETO da caracterização.
+        # Filled in later by training: here it is only the SKELETON of the card.
         "metrics": {"bpb": "", "val_loss": "", "tokens_seen": "", "wall_clock_s": ""},
         "energy": {"kwh": "", "joules_per_token": "", "hardware": ""},
         "lineage": {"run": meta["source_dir"], "parent": "", "commit": "", "notes": ""},

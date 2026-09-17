@@ -8,9 +8,9 @@ description = "Fortran library for the safetensors format: writer, reader and he
 keywords = ["safetensors", "tensors", "serialization", "machine-learning", "checkpoint"]
 categories = ["io", "data-types"]
 homepage = "https://github.com/14NGiestas/safetensors-fortran"
-# Sem dependências: nem stdlib. O que a biblioteca precisa de JSON cabe em ~900
-# linhas próprias (src/safetensors_json.f90) e isso mantém o build trivial em
-# qualquer máquina que tenha gfortran.
+# No dependencies: not even stdlib. The JSON the library needs fits in ~900 lines
+# of our own (src/safetensors_json.f90), which keeps the build trivial on any
+# machine that has gfortran.
 dependencies = {}
 
 [build]

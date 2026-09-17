@@ -13,7 +13,7 @@
 !   4. NaN/+Inf/-Inf/-0.0 preserved bit by bit -- compared as BYTES, never as floats;
 !   5. metadata with accents, JSON escapes and an empty key;
 !   6. malformed headers rejected with a stat and a message that says what is
-!      wrong (13 cases; the task asked for at least 6);
+!      wrong (20 cases over 19 files; the task asked for at least 6);
 !   7. a 1024x1024 tensor, timed, to catch quadratic copying;
 !   8. cross-language round-trip: Fortran -> Python (the oracle validates our file)
 !      and Python -> Fortran (we read the oracle's file).
@@ -209,8 +209,8 @@ contains
     call write_bytes(path, all, stat)
   end subroutine raw_file
 
-  ! Igualdade byte a byte de dois arrays de real32 (documenta que a leitura 2-D
-  ! preserva a MEMÓRIA e inverte as extensões).
+  ! Byte-for-byte equality of two real32 arrays (documents that the 2-D read
+  ! preserves the MEMORY and reverses the extents).
   pure function same_bytes(a, b) result(r)
     real(real32), intent(in) :: a(:), b(:)
     logical :: r
@@ -579,7 +579,7 @@ contains
             'all 24 payload bytes identical: NaN/Inf/-0.0 bit patterns preserved')
     block
       integer(int32) :: bits4
-      bits4 = transfer(p(4), bits4)                  ! sem 1/0.0: isso levantaria
+      bits4 = transfer(p(4), bits4)                  ! no 1/0.0: that would trap
       call ok(p(4) == 0.0 .and. bits4 == int(z'80000000', int32), &
               '-0.0 keeps its sign bit (0x80000000), not just == 0.0')
     end block

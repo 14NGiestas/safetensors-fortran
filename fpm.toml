@@ -1,0 +1,50 @@
+name = "safetensors"
+version = "0.1.0"
+license = "MIT"
+author = "Ian Giestas Pauli"
+maintainer = "Ian Giestas Pauli <iangiestas@usp.br>"
+copyright = "Copyright 2026, Ian Giestas Pauli"
+description = "Fortran library for the safetensors format: writer, reader and header inspection for tensor checkpoints, with zero external dependencies."
+keywords = ["safetensors", "tensors", "serialization", "machine-learning", "checkpoint"]
+categories = ["io", "data-types"]
+homepage = "https://github.com/14NGiestas/safetensors-fortran"
+# Sem dependências: nem stdlib. O que a biblioteca precisa de JSON cabe em ~900
+# linhas próprias (src/safetensors_json.f90) e isso mantém o build trivial em
+# qualquer máquina que tenha gfortran.
+dependencies = {}
+
+[build]
+auto-executables = false
+auto-examples = false
+auto-tests = false
+
+[fortran]
+implicit-typing = false
+implicit-external = false
+source-form = "free"
+
+[library]
+source-dir = "src"
+
+[[test]]
+name = "test_safetensors"
+source-dir = "test"
+main = "test_safetensors.f90"
+
+[[example]]
+name = "write_read"
+source-dir = "examples"
+main = "write_read.f90"
+
+[[example]]
+name = "inspect"
+source-dir = "examples"
+main = "inspect.f90"
+
+[install]
+library = true
+
+# Note on runtime checks: fpm profiles are arrays of compiler *feature* names,
+# so arbitrary flags cannot live here. The exact command the suite was verified
+# with (gfortran 15.3) is the one CI runs:
+#   fpm test --profile debug --flag "-Wall -Wextra -fcheck=all -fbacktrace -finit-real=snan"

@@ -1,0 +1,14 @@
+# fpm build artefacts
+build/
+*.mod
+*.smod
+*.o
+*.a
+
+# scratch files written by examples / tests when run from the repository root
+example.safetensors
+*.safetensors.tmp
+
+# python bytecode from tools/
+__pycache__/
+*.pyc

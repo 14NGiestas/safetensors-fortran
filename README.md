@@ -70,7 +70,7 @@ implementation) have the same SHA-256, and so do the two escaping fixtures:
 
 ```
 71ea7846eb4f3678cc5a9ef542f4f8dcbcf3f746cd49dafb8ec0673ee4b96ec0  parity
-a741175e7362c15087c70f0c1a5682b7b5f41896ff373dbf9c717cdfcfe1e845  metadata escaping
+90b41640a9b3a3e3e5c39ede0bd55371f704aedac0406fa4d35a8cf20f928648  metadata escaping
 ```
 
 ## Requirements
@@ -263,7 +263,7 @@ and each payload hash equalled that of the source array.
 ```
 src/safetensors.f90        writer + reader + validation (public module `safetensors`)
 src/safetensors_json.f90   minimal JSON parser/emitter (flat-arena DOM, no deps)
-test/test_safetensors.f90  the suite: 106 checks, PASS/FAIL counter, non-zero exit
+test/test_safetensors.f90  the suite: 108 checks, PASS/FAIL counter, non-zero exit
 test/fixtures/             reference files (official package and/or pure-Python oracle)
 test/parity_cmp.sh         runs the suite and shows the cmp/sha256 parity evidence
 examples/write_read.f90    end-to-end write/read with error handling

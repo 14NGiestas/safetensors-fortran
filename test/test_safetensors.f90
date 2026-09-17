@@ -221,6 +221,20 @@ contains
     if (r) r = all(xa == xb)
   end function same_bytes
 
+  ! The escaping torture string, built the same way tools/make_fixtures.py does:
+  ! 'ctl[' + bytes 1..31 + '] tab...' -- every control byte, so the \u00xx path
+  ! is exercised for all of them and not just for the two lucky indices.
+  function ctl_string() result(s)
+    character(len=:), allocatable :: s
+    integer :: cc
+    s = 'ctl['
+    do cc = 1, 31
+      s = s//achar(cc)
+    end do
+    s = s//'] tab'//achar(9)//' nl'//achar(10)//' cr'//achar(13)//' bs\ quote"'// &
+        ' slash/ del'//achar(127)//' nul-free acentuação ção'
+  end function ctl_string
+
   subroutine read_file_bytes(path, b, nb, stat)
     character(*), intent(in) :: path
     integer(int8), allocatable, intent(out) :: b(:)
@@ -367,16 +381,17 @@ contains
   ! ==================================================================== 3
   subroutine test_byte_parity_vs_oracle()
     type(st_writer) :: w
+    type(st_reader) :: r
     real(real32) :: a0(4) = [0.0, 0.5, 1.0, 2.25]
     real(real32) :: lq(2, 3) = reshape([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [2, 3])
     real(real32) :: wte(5) = [-1.5, 0.0, 1024.0, -0.125, 65536.0]
     real(real32) :: z(1) = [42.0]
     real(real32) :: one(1) = [1.0]
     integer(int8), allocatable :: mine(:), theirs(:), image(:)
-    character(len=:), allocatable :: msg
+    character(len=:), allocatable :: msg, val
     integer :: stat
     integer(int64) :: nb
-    logical :: same
+    logical :: same, found
 
     call section('3. byte-for-byte parity with the external oracle')
     ! Insertion order matches the official writer's order (alignment desc, name
@@ -404,9 +419,14 @@ contains
             'the in-memory to_bytes() image is byte-identical to the oracle file')
 
     ! Metadata escaping torture, single key (deterministic in every writer).
+    ! EVERY control byte 0x01..0x1F goes in: five have short escapes (\b \t \n
+    ! \f \r) and the rest must come out as \u00xx. The hex table used to be
+    ! truncated to '0123' and the \u00xx path wrote a garbage digit (0x1F ->
+    ! '\u001A') -- silently, because -Wall does not warn about it. This
+    ! comparison against the fixture written by the official writer is the test
+    ! that pins it down.
     call w%init()
-    call w%set_meta('k', 'tab'//achar(9)//' nl'//achar(10)//' cr'//achar(13)//' bs\ quote"'// &
-                    ' slash/ del'//achar(127)//' nul-free acentuação ção')
+    call w%set_meta('k', ctl_string())
     call w%set('a', one)
     call w%write(out('escapes_lib.safetensors'), stat, msg)
     call ok(stat == st_ok, 'wrote escapes_lib.safetensors')
@@ -414,8 +434,24 @@ contains
     call read_file_bytes(fixture('escapes_oracle.safetensors'), theirs, nb, stat)
     same = (size(mine) == size(theirs))
     if (same) same = all(mine == theirs)
-    call ok(same, 'cmp: JSON escaping (\\t \\n \\r \\" \\\\, DEL, UTF-8) matches the oracle '// &
+    call ok(same, 'cmp: JSON escaping (all 0x01-0x1F, DEL, UTF-8) matches the oracle '// &
             'byte for byte')
+
+    ! e o round-trip pelo proprio reader tem de devolver os MESMOS bytes
+    call r%open(out('escapes_lib.safetensors'), stat, msg)
+    call r%meta('k', val, found)
+    call ok(found .and. val == ctl_string(), 'control bytes survive our own round-trip')
+    block
+      integer :: cc, nbad2
+      character :: cb
+      nbad2 = 0
+      do cc = 1, 31
+        cb = val(4 + cc:4 + cc)          ! 'ctl[' ocupa 4; 0x01 vem em seguida
+        if (iachar(cb) /= cc) nbad2 = nbad2 + 1
+      end do
+      call ok(nbad2 == 0, 'each of the 31 control bytes comes back with its own value')
+    end block
+    call r%close()
   end subroutine test_byte_parity_vs_oracle
 
   ! ==================================================================== 4

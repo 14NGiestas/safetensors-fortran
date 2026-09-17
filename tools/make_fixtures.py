@@ -32,6 +32,10 @@ import numpy as np  # noqa: E402
 
 import reference_writer as rw  # noqa: E402
 
+# Scratch for the official-vs-oracle comparisons: inside the repo (gitignored)
+# instead of /tmp, so the generator leaves nothing outside the checkout.
+CMP_DIR = os.path.join(ROOT, "build", "fixture_cmp")
+
 try:
     from safetensors.numpy import save_file as official_save_file
 
@@ -101,10 +105,16 @@ def fixtures():
         {"escapes": 'tab\there "quote" back\\slash del\x7f acentuação \n'},
     )
 
-    # 4) metadata escaping torture (single key -> deterministic in every writer)
+    # 4) metadata escaping torture (single key -> deterministic in every writer).
+    # EVERY control byte 0x01..0x1F is in the value: the five with short escapes
+    # (\b \t \n \f \r) and the rest as \u00xx. A truncated hex table used to
+    # corrupt the \u00xx ones silently -- this fixture is what pins that down
+    # against serde_json, byte for byte.
+    ctl = "".join(chr(c) for c in range(1, 32))
     fx["escapes_oracle.safetensors"] = (
         [tensor("a", "F32", (1,), payload_of(f32(1.0)))],
-        {"k": 'tab\t nl\n cr\r bs\\ quote" slash/ del\x7f nul-free acentuação ção'},
+        {"k": 'ctl[' + ctl + '] tab\t nl\n cr\r bs\\ quote" slash/ del\x7f '
+              'nul-free acentuação ção'},
     )
 
     return fx
@@ -150,6 +160,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(ROOT, "test", "fixtures"))
     ap.add_argument("--no-official", action="store_true")
+    ap.add_argument("--refresh-official", action="store_true",
+                    help="rewrite oracle_official.safetensors (its metadata key order, "
+                         "and thus its bytes, is randomised)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     use_official = HAVE_OFFICIAL and not args.no_official
@@ -170,11 +183,11 @@ def main():
     written.append(("parity_oracle.safetensors", os.path.getsize(parity_path), "oracle"))
 
     if use_official:
-        os.makedirs("/tmp/st_fixture_cmp", exist_ok=True)
+        os.makedirs(CMP_DIR, exist_ok=True)
         # (a) the parity fixture the Fortran test compares against, written by the
         #     official library, then compared with the oracle bytes.
         arrays, meta = official_payload(tensors, metadata)
-        off_path = "/tmp/st_fixture_cmp/parity_official.safetensors"
+        off_path = os.path.join(CMP_DIR, "parity_official.safetensors")
         official_save_file(arrays, off_path, metadata=meta)
         same = rw.read(off_path)
         assert same[1]["a0"]["data"] == b"" or True
@@ -189,7 +202,7 @@ def main():
         # (b) escaping fixture: official vs oracle, single metadata key.
         esc_tensors, esc_meta = fixtures()["escapes_oracle.safetensors"]
         arrays, meta = official_payload(esc_tensors, esc_meta)
-        esc_off = "/tmp/st_fixture_cmp/escapes_official.safetensors"
+        esc_off = os.path.join(CMP_DIR, "escapes_official.safetensors")
         official_save_file(arrays, esc_off, metadata=meta)
         esc_path = os.path.join(args.out, "escapes_oracle.safetensors")
         if open(esc_off, "rb").read() == open(esc_path, "rb").read():
@@ -200,20 +213,29 @@ def main():
         # (c) mixed-dtype + multi-key metadata file written by the official lib,
         #     read by the Fortran test (interoperability, not byte parity: the
         #     official HashMap makes multi-key metadata order non-deterministic).
-        official_save_file(
-            {
-                "a": np.arange(6, dtype=np.float32).reshape(2, 3),
-                "b": np.array([1.5, -2.5], dtype=np.float64),
-                "c": np.array([-1, 1 << 30], dtype=np.int64),
-                "d": np.array([True, False], dtype=np.bool_),
-                "e": np.array([0, 200], dtype=np.uint8),
-            },
-            os.path.join(args.out, "oracle_official.safetensors"),
-            metadata={"bpb": "1.59994", "model": "lab-3m", "caracterização": "acentuação"},
-        )
+        # The official writer serialises __metadata__ from a HashMap, so the KEY
+        # ORDER (and therefore the bytes) changes on every run. This fixture is
+        # only ever READ by the suite, never compared with cmp, so it is written
+        # once and kept: rewriting it would churn the commit for nothing.
+        off_meta = os.path.join(args.out, "oracle_official.safetensors")
+        if os.path.exists(off_meta) and not args.refresh_official:
+            print("oracle_official.safetensors: kept (metadata order is randomised; "
+                  "--refresh-official to rewrite)")
+        else:
+            official_save_file(
+                {
+                    "a": np.arange(6, dtype=np.float32).reshape(2, 3),
+                    "b": np.array([1.5, -2.5], dtype=np.float64),
+                    "c": np.array([-1, 1 << 30], dtype=np.int64),
+                    "d": np.array([True, False], dtype=np.bool_),
+                    "e": np.array([0, 200], dtype=np.uint8),
+                },
+                off_meta,
+                metadata={"bpb": "1.59994", "model": "lab-3m", "caracterização": "acentuação"},
+            )
         written.append(("oracle_official.safetensors",
                         os.path.getsize(os.path.join(args.out, "oracle_official.safetensors")),
-                        "official"))
+                        "official (kept if present)"))
     else:
         print("official safetensors not importable: parity fixture comes from the oracle")
         print("(the Fortran test still compares byte for byte -- the oracle is the reference)")

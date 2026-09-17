@@ -46,7 +46,7 @@ module safetensors
   implicit none
   private
 
-  character(*), parameter, public :: st_version = '0.1.0'
+  character(*), parameter, public :: st_version = '0.1.1'
   ! Header ceiling, same as the official implementation (safetensors README:
   ! "a limit on the size of the header of 100MB"): it stops a giant header from
   ! killing memory before any validation can run.

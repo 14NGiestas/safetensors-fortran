@@ -1,5 +1,5 @@
 name = "safetensors"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 author = "Ian Giestas Pauli"
 maintainer = "Ian Giestas Pauli <iangiestas@usp.br>"

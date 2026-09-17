@@ -39,7 +39,9 @@ jobs:
         run: fpm test
 
       - name: Test with runtime checks (-fcheck=all -Wall)
-        run: fpm test --profile debug --flag "-Wall -Wextra -fcheck=all -fbacktrace -finit-real=snan"
+        # -Wcharacter-truncation is NOT part of -Wall/-Wextra and its absence is
+        # how the truncated hex table of 0.1.0 slipped through.
+        run: fpm test --profile debug --flag "-Wall -Wextra -Wcharacter-truncation -fcheck=all -fbacktrace -finit-real=snan"
 
       - name: Byte-for-byte parity against the fixtures (cmp)
         run: bash test/parity_cmp.sh

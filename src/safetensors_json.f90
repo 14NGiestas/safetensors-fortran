@@ -956,7 +956,11 @@ contains
     character :: c
     integer :: i, pos, ia
     character(len=6) :: esc
-    character(len=4), parameter :: hexd = '0123456789abcdef'   ! lowercase: same as serde_json
+    ! len=16: the table has to HOLD sixteen digits. It was declared len=4, so the
+    ! initialiser was silently truncated to '0123' and every \u00xx escape read
+    ! past the end of the constant (garbage digit, e.g. 0x1F -> '\u001A').
+    ! -Wall -Wextra do NOT catch this: it needs -Wcharacter-truncation.
+    character(len=16), parameter :: hexd = '0123456789abcdef'   ! lowercase: same as serde_json
 
     pos = 0
     do i = 1, len(s)

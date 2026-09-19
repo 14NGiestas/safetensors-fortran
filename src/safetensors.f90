@@ -869,9 +869,9 @@ contains
     character(*), intent(in) :: path
     integer, intent(out) :: stat
     character(len=:), allocatable, intent(out) :: msg
-    character(len=:), allocatable :: htext, jmsg
+    character(len=:), allocatable :: htext
     integer(int8) :: n8(8)
-    integer :: u, ios, i, j, idx, jstat, nkeys
+    integer :: u, ios
     integer(int64) :: fsz
     logical :: ex
     character(len=256) :: iomsg
@@ -967,8 +967,8 @@ contains
     character(len=:), allocatable, intent(out) :: msg
     type(json_doc) :: doc
     character(len=:), allocatable :: jmsg, tname, dtxt
-    integer :: jstat, i, j, idx, nkeys, nten, dt, r, root, inode, fnode
-    integer(int64) :: nelem, bits, nbytes, b0, b1
+    integer :: jstat, i, idx, nkeys, nten, dt, r, root, inode, fnode
+    integer(int64) :: nelem, bits, b0, b1
 
     call json_parse(htext, doc, jstat, jmsg)
     if (jstat /= json_ok) then
